@@ -1,0 +1,568 @@
+"""
+NeuroPilot Command Center — Multi-Drone Autonomy Simulator
+
+SAFE PURPOSE:
+This is a simulator-only autonomy interface. It does not connect to real drones,
+weapons, surveillance systems, or external hardware.
+
+WHAT IT DOES:
+- Simulates a fleet of autonomous drones
+- Mission planner with patrol / inspect / return-to-base modes
+- Swarm-style movement and formation control
+- Collision avoidance between drones
+- No-fly zone avoidance
+- AI-style co-pilot recommendations
+- Live telemetry dashboard
+- Event log
+- Manual operator override
+- Futuristic command-center HUD
+
+INSTALL:
+    python3 -m pip install pygame numpy
+
+RUN:
+    python3 neuropilot_command_center.py
+
+CONTROLS:
+    1       Mission: Patrol
+    2       Mission: Inspect Zone
+    3       Mission: Return To Base
+    SPACE   Pause / Resume autonomy
+    TAB     Cycle selected drone
+    W/A/S/D Manual control selected drone
+    M       Toggle manual override
+    R       Reset simulation
+    Q/ESC   Quit
+"""
+
+import math
+import random
+import time
+from dataclasses import dataclass, field
+from typing import List, Tuple
+
+import numpy as np
+import pygame
+
+# ---------------- CONFIG ----------------
+WIDTH = 1320
+HEIGHT = 780
+FPS = 60
+WORLD_RECT = pygame.Rect(30, 96, 900, 640)
+PANEL_X = 955
+DRONE_COUNT = 6
+DRONE_RADIUS = 13
+MAX_SPEED = 2.8
+MANUAL_SPEED = 4.3
+AVOID_DISTANCE = 58
+BASE_POS = np.array([105.0, 670.0])
+
+BG = (5, 9, 14)
+GRID = (14, 26, 36)
+PANEL = (12, 23, 33)
+PANEL_2 = (18, 34, 46)
+BORDER = (37, 66, 82)
+TEXT = (235, 246, 250)
+MUTED = (145, 168, 178)
+GREEN = (85, 255, 170)
+BLUE = (80, 155, 255)
+YELLOW = (255, 209, 102)
+RED = (255, 85, 85)
+PURPLE = (180, 125, 255)
+ORANGE = (255, 138, 80)
+
+
+@dataclass
+class NoFlyZone:
+    rect: pygame.Rect
+    name: str
+
+
+@dataclass
+class MissionPoint:
+    pos: np.ndarray
+    label: str
+
+
+@dataclass
+class Drone:
+    drone_id: int
+    pos: np.ndarray
+    vel: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0]))
+    target: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0]))
+    battery: float = 100.0
+    status: str = "IDLE"
+    health: str = "OK"
+    selected: bool = False
+    trail: List[Tuple[int, int]] = field(default_factory=list)
+
+    def distance_to_target(self):
+        return float(np.linalg.norm(self.target - self.pos))
+
+
+class NeuroPilotCommandCenter:
+    def __init__(self):
+        pygame.init()
+        pygame.display.set_caption("NeuroPilot Command Center — Autonomy Simulator")
+        self.screen = pygame.display.set_mode((WIDTH, HEIGHT))
+        self.clock = pygame.time.Clock()
+
+        self.font = pygame.font.SysFont("arial", 17)
+        self.font_small = pygame.font.SysFont("arial", 14)
+        self.font_bold = pygame.font.SysFont("arial", 17, bold=True)
+        self.font_title = pygame.font.SysFont("arial", 30, bold=True)
+        self.font_big = pygame.font.SysFont("arial", 44, bold=True)
+
+        self.running = True
+        self.paused = False
+        self.manual_override = False
+        self.selected_index = 0
+        self.mission = "PATROL"
+        self.mission_started = time.time()
+        self.events = []
+        self.alerts = []
+
+        self.no_fly_zones = [
+            NoFlyZone(pygame.Rect(255, 180, 160, 125), "NFZ Alpha"),
+            NoFlyZone(pygame.Rect(635, 420, 190, 140), "NFZ Bravo"),
+            NoFlyZone(pygame.Rect(455, 250, 105, 95), "Privacy Zone"),
+        ]
+
+        self.mission_points = [
+            MissionPoint(np.array([175.0, 160.0]), "WP-1"),
+            MissionPoint(np.array([820.0, 165.0]), "WP-2"),
+            MissionPoint(np.array([815.0, 660.0]), "WP-3"),
+            MissionPoint(np.array([185.0, 655.0]), "WP-4"),
+        ]
+        self.inspect_points = [
+            MissionPoint(np.array([710.0, 305.0]), "Inspect-A"),
+            MissionPoint(np.array([590.0, 610.0]), "Inspect-B"),
+            MissionPoint(np.array([330.0, 510.0]), "Inspect-C"),
+        ]
+
+        self.drones = []
+        self.reset()
+
+    # ---------------- Setup / State ----------------
+
+    def reset(self):
+        self.drones = []
+        for i in range(DRONE_COUNT):
+            offset = np.array([i * 28.0, -i * 10.0])
+            drone = Drone(i + 1, BASE_POS + offset)
+            drone.target = self.mission_points[i % len(self.mission_points)].pos.copy()
+            drone.status = "ACTIVE"
+            self.drones.append(drone)
+        self.selected_index = 0
+        self.drones[0].selected = True
+        self.paused = False
+        self.manual_override = False
+        self.mission = "PATROL"
+        self.events = []
+        self.alerts = []
+        self.log("System boot complete")
+        self.log("Mission loaded: PATROL")
+
+    def log(self, message):
+        stamp = time.strftime("%H:%M:%S")
+        self.events.insert(0, f"{stamp}  {message}")
+        self.events = self.events[:11]
+
+    def set_mission(self, mission):
+        self.mission = mission
+        self.mission_started = time.time()
+        self.log(f"Mission changed: {mission}")
+
+        if mission == "PATROL":
+            for i, drone in enumerate(self.drones):
+                drone.target = self.mission_points[i % len(self.mission_points)].pos.copy()
+                drone.status = "PATROL"
+        elif mission == "INSPECT":
+            for i, drone in enumerate(self.drones):
+                drone.target = self.inspect_points[i % len(self.inspect_points)].pos.copy()
+                drone.status = "INSPECT"
+        elif mission == "RETURN":
+            for drone in self.drones:
+                drone.target = BASE_POS.copy()
+                drone.status = "RTB"
+
+    def cycle_selected(self):
+        self.drones[self.selected_index].selected = False
+        self.selected_index = (self.selected_index + 1) % len(self.drones)
+        self.drones[self.selected_index].selected = True
+        self.log(f"Selected drone D-{self.drones[self.selected_index].drone_id:02d}")
+
+    # ---------------- Input ----------------
+
+    def handle_events(self):
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                self.running = False
+            if event.type == pygame.KEYDOWN:
+                if event.key in (pygame.K_ESCAPE, pygame.K_q):
+                    self.running = False
+                elif event.key == pygame.K_1:
+                    self.set_mission("PATROL")
+                elif event.key == pygame.K_2:
+                    self.set_mission("INSPECT")
+                elif event.key == pygame.K_3:
+                    self.set_mission("RETURN")
+                elif event.key == pygame.K_SPACE:
+                    self.paused = not self.paused
+                    self.log("Autonomy paused" if self.paused else "Autonomy resumed")
+                elif event.key == pygame.K_TAB:
+                    self.cycle_selected()
+                elif event.key == pygame.K_m:
+                    self.manual_override = not self.manual_override
+                    self.log("Manual override enabled" if self.manual_override else "Manual override disabled")
+                elif event.key == pygame.K_r:
+                    self.reset()
+
+    # ---------------- Autonomy ----------------
+
+    def manual_vector(self):
+        keys = pygame.key.get_pressed()
+        dx, dy = 0.0, 0.0
+        if keys[pygame.K_a]:
+            dx -= 1
+        if keys[pygame.K_d]:
+            dx += 1
+        if keys[pygame.K_w]:
+            dy -= 1
+        if keys[pygame.K_s]:
+            dy += 1
+        vec = np.array([dx, dy], dtype=float)
+        norm = np.linalg.norm(vec)
+        if norm > 0:
+            return vec / norm
+        return vec
+
+    def point_inside_world(self, pos):
+        return WORLD_RECT.collidepoint(float(pos[0]), float(pos[1]))
+
+    def inside_no_fly(self, pos):
+        for zone in self.no_fly_zones:
+            if zone.rect.collidepoint(float(pos[0]), float(pos[1])):
+                return zone
+        return None
+
+    def avoidance_vector(self, drone):
+        avoid = np.array([0.0, 0.0])
+
+        # Drone-to-drone collision avoidance
+        for other in self.drones:
+            if other is drone:
+                continue
+            diff = drone.pos - other.pos
+            dist = np.linalg.norm(diff)
+            if 0 < dist < AVOID_DISTANCE:
+                avoid += (diff / dist) * ((AVOID_DISTANCE - dist) / AVOID_DISTANCE) * 2.2
+
+        # No-fly zone avoidance
+        for zone in self.no_fly_zones:
+            closest_x = max(zone.rect.left, min(drone.pos[0], zone.rect.right))
+            closest_y = max(zone.rect.top, min(drone.pos[1], zone.rect.bottom))
+            closest = np.array([closest_x, closest_y])
+            diff = drone.pos - closest
+            dist = np.linalg.norm(diff)
+            if dist < 60:
+                if dist == 0:
+                    centre = np.array(zone.rect.center, dtype=float)
+                    diff = drone.pos - centre
+                    dist = max(np.linalg.norm(diff), 1)
+                avoid += (diff / dist) * ((60 - dist) / 60) * 3.5
+
+        return avoid
+
+    def assign_next_patrol_target(self, drone):
+        if drone.distance_to_target() < 18:
+            current_index = 0
+            for i, wp in enumerate(self.mission_points):
+                if np.linalg.norm(drone.target - wp.pos) < 5:
+                    current_index = i
+                    break
+            next_index = (current_index + 1 + drone.drone_id % 2) % len(self.mission_points)
+            drone.target = self.mission_points[next_index].pos.copy()
+            self.log(f"D-{drone.drone_id:02d} reached waypoint; next {self.mission_points[next_index].label}")
+
+    def update_drone(self, drone, dt):
+        if self.paused:
+            drone.vel *= 0.9
+            return
+
+        if self.manual_override and drone.selected:
+            desired = self.manual_vector() * MANUAL_SPEED
+            drone.status = "MANUAL"
+        else:
+            if self.mission == "PATROL":
+                self.assign_next_patrol_target(drone)
+            elif self.mission == "INSPECT" and drone.distance_to_target() < 20:
+                drone.status = "HOLD/SCAN"
+            elif self.mission == "RETURN" and drone.distance_to_target() < 22:
+                drone.status = "DOCKED"
+
+            to_target = drone.target - drone.pos
+            dist = np.linalg.norm(to_target)
+            if dist > 1:
+                desired = (to_target / dist) * MAX_SPEED
+            else:
+                desired = np.array([0.0, 0.0])
+
+        desired += self.avoidance_vector(drone) * MAX_SPEED
+
+        # Clamp speed
+        speed = np.linalg.norm(desired)
+        limit = MANUAL_SPEED if self.manual_override and drone.selected else MAX_SPEED
+        if speed > limit:
+            desired = desired / speed * limit
+
+        # Smooth velocity
+        drone.vel += (desired - drone.vel) * 0.08
+        new_pos = drone.pos + drone.vel
+
+        # World geofence
+        if not self.point_inside_world(new_pos):
+            drone.vel *= -0.4
+            self.alerts.append(f"D-{drone.drone_id:02d} geofence correction")
+        else:
+            drone.pos = new_pos
+
+        # No-fly zone hard stop
+        zone = self.inside_no_fly(drone.pos)
+        if zone:
+            drone.vel *= -0.8
+            drone.pos += drone.vel * 4
+            drone.status = "AVOIDING NFZ"
+            self.alerts.append(f"D-{drone.drone_id:02d} avoided {zone.name}")
+
+        drone.battery = max(0, drone.battery - 0.0035)
+        if drone.battery < 18 and self.mission != "RETURN":
+            drone.health = "LOW BATTERY"
+            drone.target = BASE_POS.copy()
+            drone.status = "AUTO-RTB"
+        else:
+            drone.health = "OK" if drone.battery >= 18 else "LOW BATTERY"
+
+        drone.trail.append((int(drone.pos[0]), int(drone.pos[1])))
+        if len(drone.trail) > 55:
+            drone.trail.pop(0)
+
+    def update(self, dt):
+        self.alerts = []
+        for drone in self.drones:
+            self.update_drone(drone, dt)
+
+        # De-duplicate alerts and occasionally log them
+        unique_alerts = list(dict.fromkeys(self.alerts))[:4]
+        self.alerts = unique_alerts
+        if unique_alerts and random.random() < 0.025:
+            self.log(unique_alerts[0])
+
+    # ---------------- AI Co-Pilot ----------------
+
+    def copilot_recommendations(self):
+        recs = []
+        low_battery = [d for d in self.drones if d.battery < 25]
+        if low_battery:
+            recs.append(f"Recommend RTB: {len(low_battery)} drone(s) below 25% battery.")
+        if self.alerts:
+            recs.append("Reduce speed near restricted zones; avoidance events detected.")
+        if self.mission == "INSPECT":
+            recs.append("Inspection mode active: hold drones near targets for scan stability.")
+        if self.manual_override:
+            recs.append("Manual override active: autonomy limited to selected drone only.")
+        if self.paused:
+            recs.append("Autonomy paused: fleet holding current positions.")
+        if not recs:
+            recs.append("Fleet stable. Continue mission. No immediate action required.")
+            recs.append("Suggested: maintain patrol spacing and monitor battery drift.")
+        return recs[:4]
+
+    def mission_summary(self):
+        active = sum(1 for d in self.drones if d.status not in ("DOCKED", "IDLE"))
+        avg_battery = sum(d.battery for d in self.drones) / len(self.drones)
+        return active, avg_battery
+
+    # ---------------- Drawing ----------------
+
+    def draw_text(self, text, x, y, color=TEXT, font=None):
+        font = font or self.font
+        surface = font.render(str(text), True, color)
+        self.screen.blit(surface, (x, y))
+
+    def draw_panel(self, rect, radius=16):
+        pygame.draw.rect(self.screen, PANEL, rect, border_radius=radius)
+        pygame.draw.rect(self.screen, BORDER, rect, 1, border_radius=radius)
+
+    def draw_top_hud(self):
+        rect = pygame.Rect(20, 18, WIDTH - 40, 68)
+        self.draw_panel(rect, 18)
+        self.draw_text("NeuroPilot Command Center", 40, 30, TEXT, self.font_title)
+        self.draw_text("Multi-Drone Autonomy Simulator", 40, 60, MUTED, self.font)
+
+        active, avg_batt = self.mission_summary()
+        self.draw_text(f"MISSION: {self.mission}", 460, 32, GREEN, self.font_bold)
+        self.draw_text(f"FLEET: {active}/{len(self.drones)} ACTIVE", 460, 58, TEXT, self.font_bold)
+        self.draw_text(f"AVG BATTERY: {avg_batt:.1f}%", 700, 32, GREEN if avg_batt > 25 else RED, self.font_bold)
+        self.draw_text(f"MODE: {'PAUSED' if self.paused else 'AUTONOMOUS'}", 700, 58, YELLOW if self.paused else GREEN, self.font_bold)
+        self.draw_text(f"OVERRIDE: {'ON' if self.manual_override else 'OFF'}", 990, 32, YELLOW if self.manual_override else MUTED, self.font_bold)
+        self.draw_text("1 Patrol  2 Inspect  3 RTB", 990, 58, MUTED, self.font_bold)
+
+    def draw_world(self):
+        pygame.draw.rect(self.screen, (7, 15, 22), WORLD_RECT, border_radius=18)
+        pygame.draw.rect(self.screen, BORDER, WORLD_RECT, 2, border_radius=18)
+
+        # Grid
+        for x in range(WORLD_RECT.left, WORLD_RECT.right, 40):
+            pygame.draw.line(self.screen, GRID, (x, WORLD_RECT.top), (x, WORLD_RECT.bottom), 1)
+        for y in range(WORLD_RECT.top, WORLD_RECT.bottom, 40):
+            pygame.draw.line(self.screen, GRID, (WORLD_RECT.left, y), (WORLD_RECT.right, y), 1)
+
+        # Base
+        pygame.draw.circle(self.screen, BLUE, BASE_POS.astype(int), 24)
+        pygame.draw.circle(self.screen, BG, BASE_POS.astype(int), 14)
+        self.draw_text("BASE", int(BASE_POS[0]) - 20, int(BASE_POS[1]) + 32, BLUE, self.font_bold)
+
+        # No-fly zones
+        for zone in self.no_fly_zones:
+            pygame.draw.rect(self.screen, (65, 22, 30), zone.rect, border_radius=12)
+            pygame.draw.rect(self.screen, RED, zone.rect, 2, border_radius=12)
+            self.draw_text(zone.name, zone.rect.x + 12, zone.rect.y + 12, RED, self.font_bold)
+            self.draw_text("restricted", zone.rect.x + 12, zone.rect.y + 36, MUTED, self.font_small)
+
+        # Mission points
+        points = self.inspect_points if self.mission == "INSPECT" else self.mission_points
+        for point in points:
+            pygame.draw.circle(self.screen, YELLOW, point.pos.astype(int), 8)
+            pygame.draw.circle(self.screen, BG, point.pos.astype(int), 4)
+            self.draw_text(point.label, int(point.pos[0]) + 10, int(point.pos[1]) - 9, YELLOW, self.font_small)
+
+        # Draw lines to targets
+        for drone in self.drones:
+            pygame.draw.line(self.screen, (32, 65, 80), drone.pos.astype(int), drone.target.astype(int), 1)
+
+        # Trails
+        for drone in self.drones:
+            if len(drone.trail) > 2:
+                color = PURPLE if drone.selected else (25, 85, 70)
+                pygame.draw.lines(self.screen, color, False, drone.trail, 2)
+
+        # Drones
+        for drone in self.drones:
+            pos = drone.pos.astype(int)
+            color = PURPLE if drone.selected else GREEN
+            if drone.health == "LOW BATTERY":
+                color = YELLOW
+            if drone.status == "AVOIDING NFZ":
+                color = RED
+
+            pygame.draw.circle(self.screen, color, pos, DRONE_RADIUS)
+            pygame.draw.circle(self.screen, BG, pos, DRONE_RADIUS - 6)
+            pygame.draw.line(self.screen, color, (pos[0] - 22, pos[1]), (pos[0] + 22, pos[1]), 3)
+            pygame.draw.line(self.screen, color, (pos[0], pos[1] - 22), (pos[0], pos[1] + 22), 3)
+
+            # Direction vector
+            vel_end = (int(pos[0] + drone.vel[0] * 12), int(pos[1] + drone.vel[1] * 12))
+            pygame.draw.line(self.screen, BLUE, pos, vel_end, 2)
+            self.draw_text(f"D-{drone.drone_id:02d}", pos[0] + 15, pos[1] - 20, color, self.font_bold)
+
+    def draw_fleet_panel(self):
+        rect = pygame.Rect(PANEL_X, 96, 340, 235)
+        self.draw_panel(rect, 18)
+        self.draw_text("Fleet Telemetry", rect.x + 18, rect.y + 16, TEXT, self.font_bold)
+
+        y = rect.y + 48
+        for drone in self.drones:
+            color = PURPLE if drone.selected else TEXT
+            batt_color = GREEN if drone.battery > 25 else RED
+            self.draw_text(f"D-{drone.drone_id:02d}", rect.x + 18, y, color, self.font_bold)
+            self.draw_text(f"{drone.status}", rect.x + 70, y, MUTED, self.font_small)
+            self.draw_text(f"{drone.battery:05.1f}%", rect.x + 200, y, batt_color, self.font_bold)
+
+            # battery bar
+            bar_x, bar_y = rect.x + 265, y + 3
+            pygame.draw.rect(self.screen, (30, 45, 52), pygame.Rect(bar_x, bar_y, 55, 9), border_radius=5)
+            pygame.draw.rect(self.screen, batt_color, pygame.Rect(bar_x, bar_y, int(55 * drone.battery / 100), 9), border_radius=5)
+            y += 30
+
+    def draw_copilot_panel(self):
+        rect = pygame.Rect(PANEL_X, 348, 340, 185)
+        self.draw_panel(rect, 18)
+        self.draw_text("AI Co-Pilot", rect.x + 18, rect.y + 16, TEXT, self.font_bold)
+        self.draw_text("recommendations", rect.x + 112, rect.y + 17, GREEN, self.font_small)
+
+        y = rect.y + 50
+        for rec in self.copilot_recommendations():
+            wrapped = self.wrap_text(rec, 37)
+            for line in wrapped:
+                self.draw_text("• " + line, rect.x + 18, y, MUTED, self.font_small)
+                y += 20
+            y += 4
+
+    def draw_event_log(self):
+        rect = pygame.Rect(PANEL_X, 550, 340, 186)
+        self.draw_panel(rect, 18)
+        self.draw_text("Event Log", rect.x + 18, rect.y + 16, TEXT, self.font_bold)
+        y = rect.y + 45
+        for event in self.events[:7]:
+            self.draw_text(event, rect.x + 18, y, MUTED, self.font_small)
+            y += 22
+
+    def draw_selected_panel(self):
+        drone = self.drones[self.selected_index]
+        rect = pygame.Rect(30, 742 - 86, 900, 80)
+        self.draw_panel(rect, 18)
+        self.draw_text(f"Selected: D-{drone.drone_id:02d}", rect.x + 18, rect.y + 16, PURPLE, self.font_bold)
+        self.draw_text(f"Status: {drone.status}", rect.x + 18, rect.y + 45, TEXT, self.font_bold)
+        self.draw_text(f"Position: {drone.pos[0]:.0f}, {drone.pos[1]:.0f}", rect.x + 200, rect.y + 16, MUTED, self.font_bold)
+        self.draw_text(f"Target: {drone.target[0]:.0f}, {drone.target[1]:.0f}", rect.x + 200, rect.y + 45, MUTED, self.font_bold)
+        self.draw_text(f"Speed: {np.linalg.norm(drone.vel):.2f}", rect.x + 430, rect.y + 16, MUTED, self.font_bold)
+        self.draw_text(f"Health: {drone.health}", rect.x + 430, rect.y + 45, GREEN if drone.health == "OK" else YELLOW, self.font_bold)
+        self.draw_text("TAB select • M override • WASD manual • SPACE pause • R reset", rect.x + 610, rect.y + 28, MUTED, self.font_small)
+
+    def draw_alert_banner(self):
+        if not self.alerts:
+            return
+        rect = pygame.Rect(285, 108, 420, 38)
+        pygame.draw.rect(self.screen, (75, 45, 14), rect, border_radius=14)
+        pygame.draw.rect(self.screen, YELLOW, rect, 1, border_radius=14)
+        self.draw_text(" | ".join(self.alerts[:2]), rect.x + 14, rect.y + 11, YELLOW, self.font_bold)
+
+    def wrap_text(self, text, width):
+        words = text.split()
+        lines = []
+        current = ""
+        for word in words:
+            if len(current + " " + word) <= width:
+                current = (current + " " + word).strip()
+            else:
+                if current:
+                    lines.append(current)
+                current = word
+        if current:
+            lines.append(current)
+        return lines
+
+    def draw(self):
+        self.screen.fill(BG)
+        self.draw_world()
+        self.draw_top_hud()
+        self.draw_fleet_panel()
+        self.draw_copilot_panel()
+        self.draw_event_log()
+        self.draw_selected_panel()
+        self.draw_alert_banner()
+        pygame.display.flip()
+
+    def run(self):
+        while self.running:
+            dt = self.clock.tick(FPS) / 1000
+            self.handle_events()
+            self.update(dt)
+            self.draw()
+        pygame.quit()
+
+
+if __name__ == "__main__":
+    app = NeuroPilotCommandCenter()
+    app.run()

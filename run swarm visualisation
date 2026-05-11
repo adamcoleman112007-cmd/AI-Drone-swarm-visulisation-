@@ -1,0 +1,8 @@
+Terminal: 
+
+
+cd ~/Desktop/NeuroPilot
+python3 -m pip install pygame numpy
+python3 neuropilot_command_center.py
+
+
